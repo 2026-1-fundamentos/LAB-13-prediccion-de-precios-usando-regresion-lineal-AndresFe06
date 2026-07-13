@@ -1,114 +1,149 @@
 #
-import gzip
+import os
 import glob
 import json
-import os
+import gzip
 import pickle
 
 import pandas as pd
+
 from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GridSearchCV
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error,
+)
 
 
-def load_and_split_datasets():
-    train = pd.read_csv("files/input/train_data.csv.zip", compression="zip", index_col=False)
-    test = pd.read_csv("files/input/test_data.csv.zip", compression="zip", index_col=False)
-
-    for df in (train, test):
-        df["Age"] = 2021 - df["Year"].astype(int)
-        df.drop(columns=["Year", "Car_Name"], inplace=True)
-        df.dropna(inplace=True)
-
-    x_train = train.drop(columns=["Present_Price"])
-    y_train = train["Present_Price"]
-    x_test = test.drop(columns=["Present_Price"])
-    y_test = test["Present_Price"]
-    return x_train, y_train, x_test, y_test
+def preparar_datos(ruta):
+    datos = pd.read_csv(ruta, compression="zip", index_col=False)
+    datos["Age"] = 2021 - datos["Year"]
+    datos = datos.drop(["Year", "Car_Name"], axis=1)
+    return datos.dropna()
 
 
-def build_pipeline(x_train):
-    categorical_columns = ["Fuel_Type", "Selling_type", "Transmission", "Owner"]
-    numerical_columns = [c for c in x_train.columns if c not in categorical_columns]
+def limpiar_directorio(ruta):
+    if os.path.exists(ruta):
+        for archivo in glob.glob(f"{ruta}/*"):
+            os.remove(archivo)
+    else:
+        os.makedirs(ruta)
 
-    preprocessor = ColumnTransformer(
+
+def entrenar_modelo(atributos, objetivo):
+
+    columnas_categoricas = [
+        "Fuel_Type",
+        "Selling_type",
+        "Transmission",
+        "Owner",
+    ]
+
+    columnas_numericas = [
+        columna
+        for columna in atributos.columns
+        if columna not in columnas_categoricas
+    ]
+
+    transformador = ColumnTransformer(
         transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_columns),
-            ("scaler", MinMaxScaler(), numerical_columns),
+            (
+                "categorias",
+                OneHotEncoder(handle_unknown="ignore"),
+                columnas_categoricas,
+            ),
+            (
+                "numeros",
+                MinMaxScaler(),
+                columnas_numericas,
+            ),
         ],
+        remainder="passthrough",
     )
 
-    return Pipeline(
+    flujo = Pipeline(
         steps=[
-            ("preprocessor", preprocessor),
-            ("select_k_best", SelectKBest(score_func=f_regression)),
-            ("regressor", LinearRegression()),
+            ("transformacion", transformador),
+            ("seleccion", SelectKBest(score_func=f_regression)),
+            ("regresion", LinearRegression()),
         ]
     )
 
-
-def train_model(x_train, y_train):
-    pipeline = build_pipeline(x_train)
-    param_grid = {"select_k_best__k": range(1, 20)}
-
-    model = GridSearchCV(
-        estimator=pipeline,
-        param_grid=param_grid,
+    busqueda = GridSearchCV(
+        estimator=flujo,
+        param_grid={
+            "seleccion__k": range(1, 20),
+        },
         cv=10,
-        scoring="neg_mean_absolute_error",
+        scoring="neg_mean_squared_error",
         n_jobs=-1,
+        verbose=2,
     )
-    model.fit(x_train, y_train)
-    return model
+
+    busqueda.fit(atributos, objetivo)
+
+    limpiar_directorio("files/models")
+
+    with gzip.open("files/models/model.pkl.gz", "wb") as archivo:
+        pickle.dump(busqueda, archivo)
 
 
-def save_model(model, path="files/models/model.pkl.gz"):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    for file in glob.glob(os.path.join(os.path.dirname(path), "*")):
-        os.remove(file)
-    with gzip.open(path, "wb") as file:
-        pickle.dump(model, file)
+def generar_metricas(x_entrenamiento, x_prueba, y_entrenamiento, y_prueba, estimador):
+
+    pred_train = estimador.predict(x_entrenamiento)
+    pred_test = estimador.predict(x_prueba)
+
+    resultados = [
+        {
+            "type": "metrics",
+            "dataset": "train",
+            "r2": r2_score(y_entrenamiento, pred_train),
+            "mse": mean_squared_error(y_entrenamiento, pred_train),
+            "mad": mean_absolute_error(y_entrenamiento, pred_train),
+        },
+        {
+            "type": "metrics",
+            "dataset": "test",
+            "r2": r2_score(y_prueba, pred_test),
+            "mse": mean_squared_error(y_prueba, pred_test),
+            "mad": mean_absolute_error(y_prueba, pred_test),
+        },
+    ]
+
+    limpiar_directorio("files/output")
+
+    with open("files/output/metrics.json", "w") as archivo:
+        for registro in resultados:
+            archivo.write(json.dumps(registro) + "\n")
 
 
-def compute_metrics(y_true, y_pred, dataset_name):
-    return {
-        "type": "metrics",
-        "dataset": dataset_name,
-        "r2": r2_score(y_true, y_pred),
-        "mse": mean_squared_error(y_true, y_pred),
-        "mad": mean_absolute_error(y_true, y_pred),
-    }
+datos_entrenamiento = preparar_datos("files/input/train_data.csv.zip")
+datos_prueba = preparar_datos("files/input/test_data.csv.zip")
 
+x_train = datos_entrenamiento.drop(columns=["Present_Price"])
+y_train = datos_entrenamiento["Present_Price"]
 
-def save_metrics(model, x_train, y_train, x_test, y_test, path="files/output/metrics.json"):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    for file in glob.glob(os.path.join(os.path.dirname(path), "*")):
-        os.remove(file)
+x_test = datos_prueba.drop(columns=["Present_Price"])
+y_test = datos_prueba["Present_Price"]
 
-    y_train_pred = model.predict(x_train)
-    y_test_pred = model.predict(x_test)
+entrenar_modelo(x_train, y_train)
 
-    train_metrics = compute_metrics(y_train, y_train_pred, "train")
-    test_metrics = compute_metrics(y_test, y_test_pred, "test")
+with gzip.open("files/models/model.pkl.gz", "rb") as archivo:
+    modelo_final = pickle.load(archivo)
 
-    with open(path, "w") as file:
-        file.write(json.dumps(train_metrics) + "\n")
-        file.write(json.dumps(test_metrics) + "\n")
+generar_metricas(
+    x_train,
+    x_test,
+    y_train,
+    y_test,
+    modelo_final,
+)
 
-
-def main():
-    x_train, y_train, x_test, y_test = load_and_split_datasets()
-    model = train_model(x_train, y_train)
-    save_model(model)
-    save_metrics(model, x_train, y_train, x_test, y_test)
-
-
-if __name__ == "__main__":
-    main()
 # En este dataset se desea pronosticar el precio de vhiculos usados. El dataset
 # original contiene las siguientes columnas:
 
